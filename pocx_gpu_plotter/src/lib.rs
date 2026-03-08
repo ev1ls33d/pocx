@@ -291,6 +291,9 @@ impl PlotterTaskBuilder {
             benchmark: self.benchmark,
             line_progress: self.line_progress,
             kws_override: self.kws_override,
+            max_concurrent_writes: None,
+            startup_messages: Vec::new(),
+            work_queue_summary: None,
         })
     }
 }

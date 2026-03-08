@@ -106,6 +106,25 @@ fn find_incomplete_plots(
             continue;
         }
 
+        // Delete 0-byte files left behind by failed preallocations
+        match entry.metadata() {
+            Ok(m) if m.len() == 0 => {
+                let path = entry.path();
+                if let Err(e) = std::fs::remove_file(&path) {
+                    eprintln!(
+                        "WARNING: Failed to delete empty .tmp file {}: {}",
+                        path.display(),
+                        e
+                    );
+                } else {
+                    eprintln!("Deleted empty .tmp file: {}/{}", dir, name);
+                }
+                continue;
+            }
+            Err(_) => continue,
+            _ => {}
+        }
+
         let parts: Vec<&str> = name.split('_').collect();
         if parts.len() != 4 {
             continue;
@@ -286,6 +305,13 @@ fn run() -> Result<()> {
                     .long("kws-override")
                     .help("tweak: overrides default gpu kernel workgroup size")
                     .global(true),
+            )
+            .arg(
+                Arg::new("concurrency")
+                    .short('c')
+                    .long("concurrency")
+                    .value_name("N")
+                    .help("max concurrent disk writes (default: unlimited, one per disk)"),
             );
 
     let matches = cmd.get_matches();
@@ -447,153 +473,175 @@ fn run() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "0:0:0".to_string());
 
-    let num_paths = output_paths.len();
-
     let auto_resume =
         !matches.get_flag("no-auto-resume") && seed.is_none() && !matches.get_flag("benchmark");
     let quiet = matches.get_flag("non-verbosity");
+    let benchmark = matches.get_flag("benchmark");
 
-    // Auto-resume: scan target paths for incomplete .tmp files and resume them first
-    if auto_resume {
-        // Collect all incomplete files grouped by path
-        let mut resume_tasks: Vec<(String, [u8; 32], u64, u8)> = Vec::new();
-        for dir in &output_paths {
-            let incomplete = find_incomplete_plots(dir, &address_payload, compress);
-            for plot in incomplete {
-                if !quiet {
-                    eprintln!(
-                        "Auto-resume: found incomplete plot in {}, seed={}, warps={}",
-                        dir,
-                        hex::encode_upper(plot.seed),
-                        plot.warps
-                    );
+    // Messages collected here, printed after the GPU banner in plotter.rs
+    let mut startup_messages: Vec<String> = Vec::new();
+
+    // Build unified work queue: resume + full plots + fill-last, all in one pass.
+    // Each entry is one "slot" in the PlotterTask (path, seed, warps, n).
+    // The ring scheduler round-robins across all slots, keeping all disks busy.
+    let mut q_paths: Vec<String> = Vec::new();
+    let mut q_seeds: Vec<Option<[u8; 32]>> = Vec::new();
+    let mut q_warps: Vec<u64> = Vec::new();
+    let mut q_plots: Vec<u64> = Vec::new();
+
+    if benchmark {
+        // Benchmark mode: simple 1:1 mapping, let plotter.rs handle defaults
+        if let Some(s) = seed {
+            q_paths.push(output_paths[0].clone());
+            q_seeds.push(Some(s));
+            q_warps.push(warps);
+            q_plots.push(number_of_plots);
+        } else {
+            for path in &output_paths {
+                q_paths.push(path.clone());
+                q_seeds.push(None);
+                q_warps.push(warps);
+                q_plots.push(number_of_plots);
+            }
+        }
+    } else {
+        // Phase 1: Collect resume jobs per path
+        if auto_resume {
+            for dir in &output_paths {
+                let incomplete = find_incomplete_plots(dir, &address_payload, compress);
+                for plot in incomplete {
+                    q_paths.push(plot.path);
+                    q_seeds.push(Some(plot.seed));
+                    q_warps.push(plot.warps);
+                    q_plots.push(1);
                 }
-                resume_tasks.push((plot.path, plot.seed, plot.warps, plot.compression));
             }
         }
 
-        if !resume_tasks.is_empty() {
-            let mut resume_paths = Vec::new();
-            let mut resume_seeds = Vec::new();
-            let mut resume_warps = Vec::new();
-            let mut resume_plots = Vec::new();
-            for (path, seed_val, warp_count, _comp) in &resume_tasks {
-                resume_paths.push(path.clone());
-                resume_seeds.push(Some(*seed_val));
-                resume_warps.push(*warp_count);
-                resume_plots.push(1u64);
+        // Count resume jobs already queued per path
+        let mut resume_count_per_path: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for p in &q_paths {
+            *resume_count_per_path.entry(p.clone()).or_insert(0) += 1;
+        }
+
+        // Phase 2 + 3: Compute full-size plots and fill-last per path
+        for path in &output_paths {
+            let space = free_disk_space(path)?;
+            let already_resumed = *resume_count_per_path.get(path).unwrap_or(&0);
+
+            // Resolve warps/n using the same logic as plotter.rs
+            let (resolved_warps, resolved_n) = if warps == 0 && number_of_plots == 0 {
+                // Neither specified — this is an error unless -f supplies work
+                if !fill_last {
+                    return Err(PoCXPlotterError::InvalidInput(
+                        "Need to specify either number of plots or number of warps".to_string(),
+                    ));
+                }
+                (0u64, 0u64)
+            } else if warps == 0 {
+                // -n given, compute warps from space
+                let remaining_n = number_of_plots.saturating_sub(already_resumed);
+                let w = if remaining_n > 0 {
+                    space / WARP_SIZE / remaining_n
+                } else {
+                    0
+                };
+                if w == 0 && remaining_n > 0 && !fill_last {
+                    return Err(PoCXPlotterError::Config(format!(
+                        "Insufficient disk space for {} file(s), available={:.2} GiB, path={}",
+                        remaining_n,
+                        space as f64 / 1024.0 / 1024.0 / 1024.0,
+                        path
+                    )));
+                }
+                (w, if w > 0 { remaining_n } else { 0 })
+            } else if number_of_plots == 0 {
+                // -w given, -n 0: fill disk with full-size files
+                let n = space / WARP_SIZE / warps;
+                (warps, n)
+            } else {
+                // Both explicit — subtract resume jobs already covering this path
+                let remaining_n = number_of_plots.saturating_sub(already_resumed);
+                (warps, remaining_n)
+            };
+
+            // Add full-size plot entry (if any files to plot)
+            if resolved_n > 0 && resolved_warps > 0 {
+                // For manual seed mode, use the provided seed
+                let entry_seed = if seed.is_some() && output_paths.len() == 1 {
+                    seed
+                } else {
+                    None
+                };
+                q_paths.push(path.clone());
+                q_seeds.push(entry_seed);
+                q_warps.push(resolved_warps);
+                q_plots.push(resolved_n);
             }
-            if !quiet {
-                eprintln!(
-                    "Auto-resume: resuming {} incomplete file(s) in parallel",
-                    resume_tasks.len()
-                );
-            }
-            let p = Plotter::new();
-            p.run(PlotterTask {
-                address_payload,
-                address: address.clone(),
-                network_id: network_id.clone(),
-                initial_seeds: resume_seeds,
-                warps: resume_warps,
-                number_of_plots: resume_plots,
-                output_paths: resume_paths,
-                compress,
-                mem: mem.clone(),
-                gpu: gpu.clone(),
-                direct_io: !matches.get_flag("disable-direct-io"),
-                escalate,
-                double_buffer: matches.get_flag("double-buffer"),
-                quiet,
-                benchmark: false,
-                line_progress: matches.get_flag("line-progress"),
-                kws_override,
-            })?;
-            if !quiet {
-                eprintln!(
-                    "Auto-resume: completed {} incomplete file(s)\n",
-                    resume_tasks.len()
-                );
+
+            // Add fill-last entry
+            if fill_last {
+                let used_by_full = resolved_n * resolved_warps * WARP_SIZE;
+                let remaining = space.saturating_sub(used_by_full);
+                let fill_w = remaining / WARP_SIZE;
+                if fill_w > 0 {
+                    q_paths.push(path.clone());
+                    q_seeds.push(None);
+                    q_warps.push(fill_w);
+                    q_plots.push(1);
+                }
             }
         }
     }
 
-    let initial_seeds = if let Some(s) = seed {
-        vec![Some(s)]
+    if q_paths.is_empty() {
+        if !quiet {
+            eprintln!("Nothing to do: no resume jobs, no plots to create, no fill space.");
+        }
+        return Ok(());
+    }
+
+    let work_queue_summary = if !quiet && !benchmark {
+        let resume_count = q_seeds.iter().filter(|s| s.is_some()).count();
+        let total_entries = q_paths.len();
+        let new_count = total_entries - resume_count;
+        Some(format!(
+            "Work queue: {} job(s) ({} resume, {} new) across {} path(s)",
+            total_entries,
+            resume_count,
+            new_count,
+            output_paths.len()
+        ))
     } else {
-        vec![None; num_paths]
+        None
     };
 
     let p = Plotter::new();
     p.run(PlotterTask {
         address_payload,
-        address: address.clone(),
-        network_id: network_id.clone(),
-        warps: vec![warps; num_paths],
-        number_of_plots: vec![number_of_plots; num_paths],
-        output_paths: output_paths.clone(),
-        initial_seeds,
+        address,
+        network_id,
+        warps: q_warps,
+        number_of_plots: q_plots,
+        output_paths: q_paths,
+        initial_seeds: q_seeds,
         compress,
-        mem: mem.clone(),
-        gpu: gpu.clone(),
+        mem,
+        gpu,
         direct_io: !matches.get_flag("disable-direct-io"),
         escalate,
         double_buffer: matches.get_flag("double-buffer"),
-        quiet: matches.get_flag("non-verbosity"),
-        benchmark: matches.get_flag("benchmark"),
+        quiet,
+        benchmark,
         line_progress: matches.get_flag("line-progress"),
         kws_override,
+        max_concurrent_writes: matches
+            .get_one::<String>("concurrency")
+            .map(|v| v.parse::<usize>().expect("concurrency must be a number")),
+        startup_messages,
+        work_queue_summary,
     })?;
-
-    // Fill-last: after main plotting, create one more file per path with remaining space
-    if fill_last && !matches.get_flag("benchmark") {
-        let mut fill_paths = Vec::new();
-        let mut fill_warps = Vec::new();
-
-        for path in &output_paths {
-            if let Ok(space) = free_disk_space(path) {
-                let remaining_warps = space / WARP_SIZE;
-                if remaining_warps > 0 {
-                    if !quiet {
-                        eprintln!(
-                            "Fill-last: {} has {:.2} GiB remaining, creating {}-warp file",
-                            path,
-                            space as f64 / 1024.0 / 1024.0 / 1024.0,
-                            remaining_warps
-                        );
-                    }
-                    fill_paths.push(path.clone());
-                    fill_warps.push(remaining_warps);
-                }
-            }
-        }
-
-        if !fill_paths.is_empty() {
-            let fill_seeds = vec![None; fill_paths.len()];
-            let fill_plots = vec![1u64; fill_paths.len()];
-
-            let p = Plotter::new();
-            p.run(PlotterTask {
-                address_payload,
-                address,
-                network_id,
-                initial_seeds: fill_seeds,
-                warps: fill_warps,
-                number_of_plots: fill_plots,
-                output_paths: fill_paths,
-                compress,
-                mem,
-                gpu,
-                direct_io: !matches.get_flag("disable-direct-io"),
-                escalate,
-                double_buffer: matches.get_flag("double-buffer"),
-                quiet,
-                benchmark: false,
-                line_progress: matches.get_flag("line-progress"),
-                kws_override,
-            })?;
-        }
-    }
 
     Ok(())
 }

@@ -101,7 +101,8 @@ pub fn create_ring_scheduler_thread(
         let mut buffer_start_warp: u64 = warp_offsets[path_pointer];
         let mut buffer_path: usize = path_pointer;
 
-        // Helper: flush current write buffer to the correct writer
+        // Helper: flush current write buffer to the correct writer.
+        // Returns false if the writer channel is disconnected.
         let flush_buffer = |write_buffer: &mut Option<PageAlignedByteBuffer>,
                             warps_in_buffer: &mut u64,
                             buffer_start_warp: &mut u64,
@@ -109,9 +110,10 @@ pub fn create_ring_scheduler_thread(
                             seed: [u8; 32],
                             next_warp_offset: u64,
                             current_warps: u64,
-                            tx_per_path: &[Sender<WriterTask>]| {
+                            tx_per_path: &[Sender<WriterTask>]|
+         -> bool {
             if let Some(buf) = write_buffer.take() {
-                tx_per_path[buffer_path]
+                if tx_per_path[buffer_path]
                     .send(WriterTask::ProcessTask {
                         buffer: buf,
                         seed,
@@ -119,10 +121,17 @@ pub fn create_ring_scheduler_thread(
                         warps_to_write: *warps_in_buffer,
                         number_of_warps: current_warps,
                     })
-                    .expect("Failed to send to writer");
+                    .is_err()
+                {
+                    eprintln!("ERROR: Writer for path {} disconnected", buffer_path);
+                    *warps_in_buffer = 0;
+                    *buffer_start_warp = next_warp_offset;
+                    return false;
+                }
                 *warps_in_buffer = 0;
                 *buffer_start_warp = next_warp_offset;
             }
+            true
         };
 
         loop {
@@ -215,7 +224,7 @@ pub fn create_ring_scheduler_thread(
 
                     // Flush buffer when full or at file boundary
                     if warps_in_buffer == escalate || at_file_boundary {
-                        flush_buffer(
+                        if !flush_buffer(
                             &mut write_buffer,
                             &mut warps_in_buffer,
                             &mut buffer_start_warp,
@@ -224,7 +233,9 @@ pub fn create_ring_scheduler_thread(
                             warp_offsets[path_pointer],
                             current_warps,
                             &tx_full_per_path,
-                        );
+                        ) {
+                            break;
+                        }
 
                         // Handle file completion
                         if at_file_boundary {
@@ -291,9 +302,16 @@ pub fn create_ring_scheduler_thread(
             );
         }
 
-        // Signal all writers to stop
+        // Signal each unique writer to stop. Multiple slots may share a sender
+        // (same physical disk), so deduplicate via same_channel() to send exactly
+        // one EndTask per writer thread.
+        let mut end_sent: Vec<&Sender<WriterTask>> = Vec::new();
         for tx in &tx_full_per_path {
-            let _ = tx.send(WriterTask::EndTask);
+            let already = end_sent.iter().any(|prev| prev.same_channel(tx));
+            if !already {
+                let _ = tx.send(WriterTask::EndTask);
+                end_sent.push(tx);
+            }
         }
 
         if let Some(pb) = &pb {

@@ -19,7 +19,8 @@
 // SOFTWARE.
 
 use bytesize::ByteSize;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, Receiver, Sender};
+use hex;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use pocx_plotfile::PoCXPlotFile;
 use std::path::Path;
@@ -66,6 +67,12 @@ pub struct PlotterTask {
     pub benchmark: bool,
     pub line_progress: bool,
     pub kws_override: usize,
+    /// Max concurrent disk writes. `None` = no limit (one per disk).
+    pub max_concurrent_writes: Option<usize>,
+    /// Messages collected during work queue building, printed after the banner.
+    pub startup_messages: Vec<String>,
+    /// Work queue summary line, printed after the slot table.
+    pub work_queue_summary: Option<String>,
 }
 
 impl Default for Plotter {
@@ -87,6 +94,9 @@ impl Plotter {
         if !task.quiet {
             println!("PoCX GPU Plotter {}", env!("CARGO_PKG_VERSION"));
             println!("written by Proof of Capacity Consortium in Rust\n");
+            for msg in &task.startup_messages {
+                eprintln!("{}", msg);
+            }
         }
 
         if !task.quiet && task.benchmark {
@@ -185,23 +195,16 @@ impl Plotter {
                             PoCXPlotterError::Config("Disk space calculation overflow".to_string())
                         })?;
 
-                    // Skip disk space check for paths being resumed
-                    if resumes[i] == 0 && required_space >= space {
-                        eprintln!(
-                            "Warning: Reported disk space may be insufficient, \
-                             MiB_required={:.2}, MiB_available={:.2}, path={}",
+                    // Skip disk space check for resume jobs (files already preallocated)
+                    if task.initial_seeds.get(i).and_then(|s| s.as_ref()).is_none()
+                        && required_space >= space
+                    {
+                        return Err(PoCXPlotterError::Config(format!(
+                            "Insufficient disk space, MiB_required={:.2}, MiB_available={:.2}, path={}",
                             required_space as f64 / 1024.0 / 1024.0,
                             space as f64 / 1024.0 / 1024.0,
                             &task.output_paths[i]
-                        );
-                        eprintln!(
-                            "Proceeding anyway because warps and number of plots \
-                             were both explicitly specified."
-                        );
-                        eprintln!(
-                            "Note: space detection on network drives may be \
-                             inaccurate. Verify manually if needed."
-                        );
+                        )));
                     }
                 }
             }
@@ -228,9 +231,22 @@ impl Plotter {
             available_mem
         };
 
-        // 1 buffer per output path, +1 if double buffering enabled
-        let num_write_buffers =
-            task.output_paths.len() as u64 + if task.double_buffer { 1 } else { 0 };
+        // 1 buffer per unique physical disk path + 1 if double buffering enabled.
+        // Multiple job slots on the same disk share buffers.
+        // When -c limits concurrency, cap buffer count so only that many
+        // writes can be in-flight at once — the GPU pipeline blocks naturally.
+        let unique_disk_count = {
+            let mut unique = task.output_paths.clone();
+            unique.sort();
+            unique.dedup();
+            unique.len() as u64
+        };
+        let effective_writers = if let Some(c) = task.max_concurrent_writes {
+            (c as u64).min(unique_disk_count).max(1)
+        } else {
+            unique_disk_count
+        };
+        let num_write_buffers = effective_writers + if task.double_buffer { 1 } else { 0 };
 
         if max_mem_usage < mem_write * num_write_buffers {
             return Err(PoCXPlotterError::Memory(format!(
@@ -267,7 +283,7 @@ impl Plotter {
                 (mem_write * num_write_buffers) as f64 / 1024.0 / 1024.0 / 1024.0,
             );
             println!(
-                "     Cache(HDD)={:.2} GiB x{} (escalation) x{} (buffers{}), Cache(GPU)={:.2} GiB",
+                "     Cache(HDD)={:.2} GiB x{} (escalation) x{} (buffers{}), Cache(GPU)={:.2} GiB\n",
                 WARP_SIZE as f64 / 1024.0 / 1024.0 / 1024.0,
                 task.escalate,
                 num_write_buffers,
@@ -295,14 +311,110 @@ impl Plotter {
                 hex::encode_upper(task.address_payload)
             );
             println!(
-                "Compression    : {}(X{})",
+                "Compression   : {}(X{})",
                 1u64 << task.compress,
                 task.compress
             );
-            println!("Output path(s) : {:?}", task.output_paths);
-            println!("Files to plot  : {:?}", task.number_of_plots);
-            println!("Warps per file : {:?}", task.warps);
-            println!("Total warps    : {}\n", total_warps);
+            println!("Total warps   : {}\n", total_warps);
+
+            // Build the per-slot table: Path | Files | Warps | Resume | Seed
+            let n = task.output_paths.len();
+            let resume_strs: Vec<String> = resumes
+                .iter()
+                .map(|&r| {
+                    if r > 0 {
+                        r.to_string()
+                    } else {
+                        "-".to_string()
+                    }
+                })
+                .collect();
+            let seed_strs: Vec<String> = task
+                .initial_seeds
+                .iter()
+                .map(|s| match s {
+                    Some(seed) => {
+                        let full = hex::encode_upper(seed);
+                        format!("{}...", &full[..20])
+                    }
+                    None => "-".to_string(),
+                })
+                .collect();
+
+            let col_path = task
+                .output_paths
+                .iter()
+                .map(|s| s.len())
+                .max()
+                .unwrap_or(4)
+                .max(4);
+            let col_files = task
+                .number_of_plots
+                .iter()
+                .map(|v| v.to_string().len())
+                .max()
+                .unwrap_or(5)
+                .max(5);
+            let col_warps = task
+                .warps
+                .iter()
+                .map(|v| v.to_string().len())
+                .max()
+                .unwrap_or(5)
+                .max(5);
+            let col_res = resume_strs
+                .iter()
+                .map(|s| s.len())
+                .max()
+                .unwrap_or(6)
+                .max(6);
+            let col_seed = seed_strs.iter().map(|s| s.len()).max().unwrap_or(4).max(4);
+
+            println!(
+                "{:<col_path$}  {:>col_files$}  {:>col_warps$}  {:>col_res$}  {:<col_seed$}",
+                "Path",
+                "Files",
+                "Warps",
+                "Resume",
+                "Seed",
+                col_path = col_path,
+                col_files = col_files,
+                col_warps = col_warps,
+                col_res = col_res,
+                col_seed = col_seed
+            );
+            println!(
+                "{:-<col_path$}  {:->col_files$}  {:->col_warps$}  {:->col_res$}  {:-<col_seed$}",
+                "",
+                "",
+                "",
+                "",
+                "",
+                col_path = col_path,
+                col_files = col_files,
+                col_warps = col_warps,
+                col_res = col_res,
+                col_seed = col_seed
+            );
+            for i in 0..n {
+                println!(
+                    "{:<col_path$}  {:>col_files$}  {:>col_warps$}  {:>col_res$}  {:<col_seed$}",
+                    task.output_paths[i],
+                    task.number_of_plots[i],
+                    task.warps[i],
+                    resume_strs[i],
+                    seed_strs[i],
+                    col_path = col_path,
+                    col_files = col_files,
+                    col_warps = col_warps,
+                    col_res = col_res,
+                    col_seed = col_seed
+                );
+            }
+            println!();
+            if let Some(ref summary) = task.work_queue_summary {
+                println!("{}", summary);
+            }
 
             #[cfg(windows)]
             if !is_elevated() {
@@ -314,12 +426,7 @@ impl Plotter {
             if total_resume == 0 {
                 println!("Starting plotting...\n");
             } else {
-                for (i, &r) in resumes.iter().enumerate() {
-                    if r > 0 {
-                        println!("Resuming path {} from warp offset {}...", i, r);
-                    }
-                }
-                println!();
+                println!("Resuming...\n");
             }
         }
 
@@ -378,23 +485,70 @@ impl Plotter {
         let gpu_ctx = gpu_ring_init(&task.gpu, task.kws_override)
             .map_err(|e| PoCXPlotterError::Hardware(format!("GPU init failed: {}", e)))?;
 
-        // Create one writer thread per output path, each with a dedicated channel
+        // Build slot → unique-disk mapping so we create one writer per physical disk.
+        // Multiple job slots targeting the same disk share a single writer thread.
+        let mut disk_first_slot: Vec<usize> = Vec::new();
+        let mut slot_to_disk: Vec<usize> = Vec::new();
+        {
+            let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for (slot, path) in task.output_paths.iter().enumerate() {
+                let disk_idx = *seen.entry(path.as_str()).or_insert_with(|| {
+                    let idx = disk_first_slot.len();
+                    disk_first_slot.push(slot);
+                    idx
+                });
+                slot_to_disk.push(disk_idx);
+            }
+        }
+
+        // Create one writer thread per unique disk.
+        // An I/O semaphore limits concurrent NAS writes to avoid overwhelming SMB.
+        let num_disks = disk_first_slot.len();
+        let io_permit: Option<(Sender<()>, Receiver<()>)> =
+            if let Some(limit) = task.max_concurrent_writes {
+                let limit = limit.min(num_disks).max(1);
+                let (tx, rx) = bounded(limit);
+                for _ in 0..limit {
+                    tx.send(()).unwrap();
+                }
+                if !task.quiet {
+                    eprintln!(
+                        "Note: {} unique disks, limiting concurrent writes to {} (-c)",
+                        num_disks, limit
+                    );
+                }
+                Some((tx, rx))
+            } else {
+                None
+            };
+
         let mut writers = Vec::new();
-        let mut tx_full_per_path = Vec::new();
-        for (i, _) in task.output_paths.iter().enumerate() {
+        let mut disk_senders = Vec::new();
+        for &first_slot in &disk_first_slot {
             let (tx_full, rx_full) = bounded(num_write_buffers as usize);
             let write_progress = write_pb.as_ref().cloned();
+            let permit: Option<(Receiver<()>, Sender<()>)> =
+                io_permit.as_ref().map(|(tx, rx)| (rx.clone(), tx.clone()));
             writers.push(thread::spawn({
                 create_writer_thread(
                     task.clone(),
                     write_progress,
                     rx_full,
                     tx_empty_write_buffers.clone(),
-                    i,
+                    first_slot,
+                    permit,
                 )
             }));
-            tx_full_per_path.push(tx_full);
+            disk_senders.push(tx_full);
         }
+
+        // Per-slot sender: each slot's sender is a clone of its disk's sender.
+        // The ring scheduler indexes by slot — this routes to the shared writer.
+        let tx_full_per_path: Vec<_> = slot_to_disk
+            .iter()
+            .map(|&disk_idx| disk_senders[disk_idx].clone())
+            .collect();
+        drop(disk_senders);
 
         // Create ring scheduler thread
         let hasher = thread::spawn({
@@ -434,6 +588,17 @@ impl Plotter {
                 session_nonces as f64 * 1000.0 / (elapsed as f64 + 1.0) / 4.0 / 2.0,
                 session_nonces as f64 * 1000.0 / (elapsed as f64 + 1.0) * 60.0 * 60.0 / 8192.0
             );
+
+            let dropped =
+                crate::disk_writer::WARPS_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+            if dropped > 0 {
+                eprintln!(
+                    "\nWARNING: {} warp(s) ({:.2} GiB) lost to write errors and need re-computation. \
+                     Re-run with the same parameters to resume.",
+                    dropped,
+                    dropped as f64 * WARP_SIZE as f64 / 1024.0 / 1024.0 / 1024.0
+                );
+            }
         }
 
         if let Some(cb) = get_plotter_callback() {
