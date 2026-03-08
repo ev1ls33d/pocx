@@ -149,7 +149,12 @@ fn find_incomplete_plots(
             continue;
         }
 
-        let warps_done = PoCXPlotFile::new(
+        // Open the file to read how many warps were already committed.
+        // If we can open the file but find 0 warps written (preallocated but
+        // never started, or RESUME_MAGIC absent), delete it: the file holds no
+        // useful data and keeping it would shrink the fill-slot size on every
+        // restart, causing the resume queue to grow indefinitely.
+        let plot_file = PoCXPlotFile::new(
             dir,
             address_payload,
             &seed,
@@ -157,10 +162,27 @@ fn find_incomplete_plots(
             compression,
             false,
             false,
-        )
-        .ok()
-        .and_then(|mut pf| pf.read_resume_info().ok())
-        .unwrap_or(0);
+        );
+        let warps_done = match plot_file {
+            Err(_) => continue, // Can't open → leave it alone
+            Ok(mut pf) => match pf.read_resume_info() {
+                Ok(0) | Err(_) => {
+                    // 0 warps written or no resume marker — delete the empty skeleton
+                    let path = entry.path();
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        eprintln!(
+                            "WARNING: Failed to delete unstarted .tmp file {}: {}",
+                            path.display(),
+                            e
+                        );
+                    } else {
+                        eprintln!("Deleted unstarted .tmp file: {}/{}", dir, name);
+                    }
+                    continue;
+                }
+                Ok(w) => w,
+            },
+        };
 
         results.push(IncompletePlot {
             path: dir.to_string(),
