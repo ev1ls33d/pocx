@@ -670,12 +670,13 @@ fn run() -> Result<()> {
         let resume_count = q_seeds.iter().filter(|s| s.is_some()).count();
         let total_entries = q_paths.len();
         let new_count = total_entries - resume_count;
+        let unique_paths = q_paths
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         Some(format!(
-            "Work queue: {} job(s) ({} resume, {} new) across {} path(s)",
-            total_entries,
-            resume_count,
-            new_count,
-            output_paths.len()
+            "Work queue: {} job(s) ({} resume, {} new) across {} unique path(s)",
+            total_entries, resume_count, new_count, unique_paths
         ))
     } else {
         None
