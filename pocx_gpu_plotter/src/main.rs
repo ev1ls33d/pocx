@@ -624,8 +624,12 @@ fn run() -> Result<()> {
                 q_plots.push(resolved_n);
             }
 
-            // Add fill-last entry
-            if fill_last {
+            // Add fill-last entry only when no resume files are pending for this disk.
+            // If resumes exist, starting a fill file races with them: the fill (often
+            // the shortest slot due to rounding) gets scheduled first, gets killed, and
+            // becomes yet another resume on the next restart — causing unbounded queue
+            // growth. Skip it; the fill will be computed correctly once the disk is clean.
+            if fill_last && already_resumed == 0 {
                 let used_by_full = resolved_n * resolved_warps * WARP_SIZE;
                 let remaining = space.saturating_sub(used_by_full);
                 let fill_w = remaining / WARP_SIZE;
