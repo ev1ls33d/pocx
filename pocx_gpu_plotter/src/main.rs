@@ -70,13 +70,17 @@ pub fn get_plotter_callback() -> Option<Arc<dyn PlotterCallback>> {
 use crate::plotter::{Plotter, PlotterTask, WARP_SIZE};
 use crate::utils::{free_disk_space, set_low_prio};
 use clap::{Arg, Command};
+use pocx_plotfile::PoCXPlotFile;
 use std::process;
 
 /// Represents an incomplete plot file found on disk.
 struct IncompletePlot {
     path: String,
     seed: [u8; 32],
+    /// Total warps in the file (from filename).
     warps: u64,
+    /// Warps already written (resume offset read from the file header).
+    warps_done: u64,
     compression: u8,
 }
 
@@ -145,10 +149,24 @@ fn find_incomplete_plots(
             continue;
         }
 
+        let warps_done = PoCXPlotFile::new(
+            dir,
+            address_payload,
+            &seed,
+            warps,
+            compression,
+            false,
+            false,
+        )
+        .ok()
+        .and_then(|mut pf| pf.read_resume_info().ok())
+        .unwrap_or(0);
+
         results.push(IncompletePlot {
             path: dir.to_string(),
             seed,
             warps,
+            warps_done,
             compression,
         });
     }
@@ -488,6 +506,8 @@ fn run() -> Result<()> {
     let mut q_seeds: Vec<Option<[u8; 32]>> = Vec::new();
     let mut q_warps: Vec<u64> = Vec::new();
     let mut q_plots: Vec<u64> = Vec::new();
+    // Remaining warps to write per slot — used to sort shortest-first.
+    let mut q_remaining: Vec<u64> = Vec::new();
 
     if benchmark {
         // Benchmark mode: simple 1:1 mapping, let plotter.rs handle defaults
@@ -510,6 +530,7 @@ fn run() -> Result<()> {
             for dir in &output_paths {
                 let incomplete = find_incomplete_plots(dir, &address_payload, compress);
                 for plot in incomplete {
+                    q_remaining.push(plot.warps.saturating_sub(plot.warps_done));
                     q_paths.push(plot.path);
                     q_seeds.push(Some(plot.seed));
                     q_warps.push(plot.warps);
@@ -574,6 +595,7 @@ fn run() -> Result<()> {
                 } else {
                     None
                 };
+                q_remaining.push(resolved_warps * resolved_n);
                 q_paths.push(path.clone());
                 q_seeds.push(entry_seed);
                 q_warps.push(resolved_warps);
@@ -586,6 +608,7 @@ fn run() -> Result<()> {
                 let remaining = space.saturating_sub(used_by_full);
                 let fill_w = remaining / WARP_SIZE;
                 if fill_w > 0 {
+                    q_remaining.push(fill_w);
                     q_paths.push(path.clone());
                     q_seeds.push(None);
                     q_warps.push(fill_w);
@@ -600,6 +623,21 @@ fn run() -> Result<()> {
             eprintln!("Nothing to do: no resume jobs, no plots to create, no fill space.");
         }
         return Ok(());
+    }
+
+    // Sort all slots by remaining warps ascending: shortest work completes first,
+    // freeing GPU pressure sooner and balancing disk I/O across the run.
+    if !benchmark && q_paths.len() > 1 {
+        let mut order: Vec<usize> = (0..q_paths.len()).collect();
+        order.sort_unstable_by_key(|&i| q_remaining[i]);
+        let sorted_paths: Vec<String> = order.iter().map(|&i| q_paths[i].clone()).collect();
+        let sorted_seeds: Vec<Option<[u8; 32]>> = order.iter().map(|&i| q_seeds[i]).collect();
+        let sorted_warps: Vec<u64> = order.iter().map(|&i| q_warps[i]).collect();
+        let sorted_plots: Vec<u64> = order.iter().map(|&i| q_plots[i]).collect();
+        q_paths = sorted_paths;
+        q_seeds = sorted_seeds;
+        q_warps = sorted_warps;
+        q_plots = sorted_plots;
     }
 
     let work_queue_summary = if !quiet && !benchmark {

@@ -62,7 +62,12 @@ pub fn create_ring_scheduler_thread(
 
         // Disk-level scheduling: group slots by disk so that all buffers for
         // file N on a disk are sent before file N+1, preventing fragmentation.
-        let num_disks = slot_to_disk.iter().copied().max().map(|m| m + 1).unwrap_or(1);
+        let num_disks = slot_to_disk
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1);
         let mut disk_slots: Vec<Vec<usize>> = vec![Vec::new(); num_disks];
         for (slot, &disk) in slot_to_disk.iter().enumerate() {
             disk_slots[disk].push(slot);
