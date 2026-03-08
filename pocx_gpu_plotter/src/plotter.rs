@@ -559,6 +559,7 @@ impl Plotter {
                 rx_empty_write_buffers,
                 tx_full_per_path,
                 resumes,
+                slot_to_disk,
             )
         });
 
