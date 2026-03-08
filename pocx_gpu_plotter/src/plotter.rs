@@ -51,7 +51,8 @@ pub struct PlotterTask {
     pub address_payload: [u8; 20],
     pub address: String,
     pub network_id: pocx_address::NetworkId,
-    pub seed: Option<[u8; 32]>,
+    /// Per-path initial seeds. `Some` = resume with this seed, `None` = generate random.
+    pub initial_seeds: Vec<Option<[u8; 32]>>,
     pub warps: Vec<u64>,
     pub number_of_plots: Vec<u64>,
     pub output_paths: Vec<String>,
@@ -115,29 +116,32 @@ impl Plotter {
             }
         }
 
-        // Check resume
-        let mut resume = 0;
-        if let Some(seed) = task.seed {
-            let optimized_plot_file = PoCXPlotFile::new(
-                &task.output_paths[0],
-                &task.address_payload,
-                &seed,
-                task.warps[0],
-                task.compress,
-                false,
-                false,
-            );
-            if let Ok(mut plot_file) = optimized_plot_file {
-                if let Ok(progress) = plot_file.read_resume_info() {
-                    resume = progress;
+        // Check resume per path
+        let mut resumes: Vec<u64> = vec![0; task.output_paths.len()];
+        for i in 0..task.output_paths.len() {
+            if let Some(seed) = task.initial_seeds.get(i).copied().flatten() {
+                let optimized_plot_file = PoCXPlotFile::new(
+                    &task.output_paths[i],
+                    &task.address_payload,
+                    &seed,
+                    task.warps[i],
+                    task.compress,
+                    false,
+                    false,
+                );
+                if let Ok(mut plot_file) = optimized_plot_file {
+                    if let Ok(progress) = plot_file.read_resume_info() {
+                        resumes[i] = progress;
+                    }
                 }
             }
         }
+        let total_resume: u64 = resumes.iter().sum();
 
         // Validate warps and disk space per path
         if task.benchmark {
             for i in 0..task.output_paths.len() {
-                if task.warps[i] == 0 {
+                if task.warps[i] == 0 || task.warps[i] == u64::MAX {
                     task.warps[i] = 1;
                 }
                 if task.number_of_plots[i] == 0 {
@@ -156,11 +160,38 @@ impl Plotter {
 
                 let space = free_disk_space(&task.output_paths[i])?;
 
-                if task.warps[i] == 0 {
+                if task.warps[i] == u64::MAX {
+                    // -w -1: fill remaining space
+                    let n = if task.number_of_plots[i] == 0 {
+                        1
+                    } else {
+                        task.number_of_plots[i]
+                    };
+                    task.warps[i] = space / WARP_SIZE / n;
+                    if task.number_of_plots[i] == 0 {
+                        task.number_of_plots[i] = 1;
+                    }
+                    if task.warps[i] == 0 {
+                        return Err(PoCXPlotterError::Config(format!(
+                            "Insufficient remaining disk space to fill, \
+                             MiB_available={:.2}, path={}",
+                            space as f64 / 1024.0 / 1024.0,
+                            &task.output_paths[i]
+                        )));
+                    }
+                    if !task.quiet {
+                        eprintln!(
+                            "Fill mode: detected {:.2} GiB free on {}, using {} warps x {} file(s)",
+                            space as f64 / 1024.0 / 1024.0 / 1024.0,
+                            &task.output_paths[i],
+                            task.warps[i],
+                            task.number_of_plots[i]
+                        );
+                    }
+                } else if task.warps[i] == 0 {
                     if task.number_of_plots[i] == 0 {
                         return Err(PoCXPlotterError::InvalidInput(
-                            "Need to specify either number of plots or number of warps"
-                                .to_string(),
+                            "Need to specify either number of plots or number of warps".to_string(),
                         ));
                     }
                     task.warps[i] = space / WARP_SIZE / task.number_of_plots[i];
@@ -179,19 +210,26 @@ impl Plotter {
                         .checked_mul(task.number_of_plots[i])
                         .and_then(|v| v.checked_mul(WARP_SIZE))
                         .ok_or_else(|| {
-                            PoCXPlotterError::Config(
-                                "Disk space calculation overflow".to_string(),
-                            )
+                            PoCXPlotterError::Config("Disk space calculation overflow".to_string())
                         })?;
 
-                    // Only check disk space for first path if resuming
-                    if (i > 0 || resume == 0) && required_space >= space {
-                        return Err(PoCXPlotterError::Config(format!(
-                            "Insufficient disk space, MiB_required={:.2}, MiB_available={:.2}, path={}",
+                    // Skip disk space check for paths being resumed
+                    if resumes[i] == 0 && required_space >= space {
+                        eprintln!(
+                            "Warning: Reported disk space may be insufficient, \
+                             MiB_required={:.2}, MiB_available={:.2}, path={}",
                             required_space as f64 / 1024.0 / 1024.0,
                             space as f64 / 1024.0 / 1024.0,
                             &task.output_paths[i]
-                        )));
+                        );
+                        eprintln!(
+                            "Proceeding anyway because warps and number of plots \
+                             were both explicitly specified."
+                        );
+                        eprintln!(
+                            "Note: space detection on network drives may be \
+                             inaccurate. Verify manually if needed."
+                        );
                     }
                 }
             }
@@ -200,11 +238,15 @@ impl Plotter {
         // Host memory: only need write buffers (1 GiB each * escalate)
         let mem_write = WARP_SIZE * task.escalate;
 
-        let mem_limit = task.mem.parse::<ByteSize>()
-            .map_err(|_| PoCXPlotterError::InvalidInput(format!(
-                "Can't parse memory limit parameter: {}. Example: --mem 10GiB",
-                task.mem
-            )))?
+        let mem_limit = task
+            .mem
+            .parse::<ByteSize>()
+            .map_err(|_| {
+                PoCXPlotterError::InvalidInput(format!(
+                    "Can't parse memory limit parameter: {}. Example: --mem 10GiB",
+                    task.mem
+                ))
+            })?
             .as_u64();
 
         let available_mem = sys.available_memory();
@@ -215,8 +257,8 @@ impl Plotter {
         };
 
         // 1 buffer per output path, +1 if double buffering enabled
-        let num_write_buffers = task.output_paths.len() as u64
-            + if task.double_buffer { 1 } else { 0 };
+        let num_write_buffers =
+            task.output_paths.len() as u64 + if task.double_buffer { 1 } else { 0 };
 
         if max_mem_usage < mem_write * num_write_buffers {
             return Err(PoCXPlotterError::Memory(format!(
@@ -235,14 +277,14 @@ impl Plotter {
             .zip(task.number_of_plots.iter())
             .map(|(w, n)| w * n)
             .sum();
-        let total_warps = total_planned_warps - resume;
+        let total_warps = total_planned_warps - total_resume;
 
         if task.line_progress {
             println!("#TOTAL:{}", total_warps);
         }
 
         if let Some(cb) = get_plotter_callback() {
-            cb.on_started(total_warps, resume);
+            cb.on_started(total_warps, total_resume);
         }
 
         if !task.quiet {
@@ -257,7 +299,11 @@ impl Plotter {
                 WARP_SIZE as f64 / 1024.0 / 1024.0 / 1024.0,
                 task.escalate,
                 num_write_buffers,
-                if task.double_buffer { ", double-buffered" } else { "" },
+                if task.double_buffer {
+                    ", double-buffered"
+                } else {
+                    ""
+                },
                 mem_gpu as f64 / 1024.0 / 1024.0 / 1024.0,
             );
 
@@ -276,7 +322,11 @@ impl Plotter {
                 "Address Hex   : {} (network-independent payload)",
                 hex::encode_upper(task.address_payload)
             );
-            println!("Compression    : {}(X{})", 1u64 << task.compress, task.compress);
+            println!(
+                "Compression    : {}(X{})",
+                1u64 << task.compress,
+                task.compress
+            );
             println!("Output path(s) : {:?}", task.output_paths);
             println!("Files to plot  : {:?}", task.number_of_plots);
             println!("Warps per file : {:?}", task.warps);
@@ -289,16 +339,20 @@ impl Plotter {
                 );
             }
 
-            if resume == 0 {
+            if total_resume == 0 {
                 println!("Starting plotting...\n");
             } else {
-                println!("Resuming plotting from warp offset {}...\n", resume);
+                for (i, &r) in resumes.iter().enumerate() {
+                    if r > 0 {
+                        println!("Resuming path {} from warp offset {}...", i, r);
+                    }
+                }
+                println!();
             }
         }
 
         // Create shared empty-buffer pool
-        let (tx_empty_write_buffers, rx_empty_write_buffers) =
-            bounded(num_write_buffers as usize);
+        let (tx_empty_write_buffers, rx_empty_write_buffers) = bounded(num_write_buffers as usize);
 
         // Allocate write buffers (each holds `escalate` warps)
         for _ in 0..num_write_buffers {
@@ -378,7 +432,7 @@ impl Plotter {
                 hash_pb,
                 rx_empty_write_buffers,
                 tx_full_per_path,
-                resume,
+                resumes,
             )
         });
 

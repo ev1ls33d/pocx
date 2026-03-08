@@ -61,8 +61,7 @@ pub trait PlotterCallback: Send + Sync {
     fn on_error(&self, error: &str);
 }
 
-static PLOTTER_CALLBACK: std::sync::OnceLock<Arc<dyn PlotterCallback>> =
-    std::sync::OnceLock::new();
+static PLOTTER_CALLBACK: std::sync::OnceLock<Arc<dyn PlotterCallback>> = std::sync::OnceLock::new();
 
 pub fn get_plotter_callback() -> Option<Arc<dyn PlotterCallback>> {
     PLOTTER_CALLBACK.get().cloned()
@@ -72,6 +71,70 @@ use crate::plotter::{Plotter, PlotterTask};
 use crate::utils::set_low_prio;
 use clap::{Arg, Command};
 use std::process;
+
+/// Represents an incomplete plot file found on disk.
+struct IncompletePlot {
+    path: String,
+    seed: [u8; 32],
+    warps: u64,
+    compression: u8,
+}
+
+/// Scan a directory for `.tmp` files matching the given address payload and compression.
+fn find_incomplete_plots(
+    dir: &str,
+    address_payload: &[u8; 20],
+    compression: u8,
+) -> Vec<IncompletePlot> {
+    let addr_hex = hex::encode_upper(address_payload);
+    let suffix = format!("_X{}.tmp", compression);
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        // Match: {ADDR_HEX}_{SEED_HEX}_{WARPS}_X{COMPRESSION}.tmp
+        if !name.starts_with(&addr_hex) || !name.ends_with(&suffix) {
+            continue;
+        }
+
+        let parts: Vec<&str> = name.split('_').collect();
+        if parts.len() != 4 {
+            continue;
+        }
+
+        let seed_hex = parts[1];
+        if seed_hex.len() != 64 || !seed_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+
+        let warps = match parts[2].parse::<u64>() {
+            Ok(w) if w > 0 => w,
+            _ => continue,
+        };
+
+        let mut seed = [0u8; 32];
+        if hex::decode_to_slice(seed_hex, &mut seed).is_err() {
+            continue;
+        }
+
+        results.push(IncompletePlot {
+            path: dir.to_string(),
+            seed,
+            warps,
+            compression,
+        });
+    }
+    results
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -138,7 +201,7 @@ fn run() -> Result<()> {
                 .short('w')
                 .long("warps")
                 .value_name("warps")
-                .help("how many warps you want to plot (1 warp = 1 GiB, default: fill disk)"),
+                .help("how many warps per file (1 warp = 1 GiB, 0: fill disk, -1: fill remaining space)"),
         )
         .arg(
             Arg::new("number")
@@ -197,6 +260,13 @@ fn run() -> Result<()> {
                 .help("GPU to use for plotting (default: 0:0:0 = first GPU, all CUs)"),
         )
         .arg(
+            Arg::new("no-auto-resume")
+                .long("no-auto-resume")
+                .help("Disable automatic resumption of incomplete .tmp files")
+                .action(clap::ArgAction::SetTrue)
+                .global(true),
+        )
+        .arg(
             Arg::new("ocl-devices")
                 .short('o')
                 .long("opencl")
@@ -247,9 +317,18 @@ fn run() -> Result<()> {
     let warps = matches
         .get_one::<String>("warps")
         .map(|s| {
-            let value = s.parse::<u64>().map_err(|e| {
+            let value = s.parse::<i64>().map_err(|e| {
                 PoCXPlotterError::InvalidInput(format!("Invalid warps value: {}", e))
             })?;
+            if value == -1 {
+                return Ok::<u64, PoCXPlotterError>(u64::MAX);
+            }
+            if value < 0 {
+                return Err(PoCXPlotterError::InvalidInput(
+                    "Warps must be >= 0 or -1 (fill remaining space)".to_string(),
+                ));
+            }
+            let value = value as u64;
             if value > 1_000_000 {
                 return Err(PoCXPlotterError::InvalidInput(
                     "Warps value too large: maximum 1,000,000 allowed".to_string(),
@@ -263,9 +342,8 @@ fn run() -> Result<()> {
     let number_of_plots = matches
         .get_one::<String>("number")
         .map(|s| {
-            s.parse::<u64>().map_err(|e| {
-                PoCXPlotterError::InvalidInput(format!("Invalid number value: {}", e))
-            })
+            s.parse::<u64>()
+                .map_err(|e| PoCXPlotterError::InvalidInput(format!("Invalid number value: {}", e)))
         })
         .transpose()?
         .unwrap_or(1);
@@ -369,6 +447,82 @@ fn run() -> Result<()> {
         .unwrap_or_else(|| "0:0:0".to_string());
 
     let num_paths = output_paths.len();
+
+    let auto_resume =
+        !matches.get_flag("no-auto-resume") && seed.is_none() && !matches.get_flag("benchmark");
+    let quiet = matches.get_flag("non-verbosity");
+
+    // Auto-resume: scan target paths for incomplete .tmp files and resume them first
+    if auto_resume {
+        // Collect all incomplete files grouped by path
+        let mut resume_tasks: Vec<(String, [u8; 32], u64, u8)> = Vec::new();
+        for dir in &output_paths {
+            let incomplete = find_incomplete_plots(dir, &address_payload, compress);
+            for plot in incomplete {
+                if !quiet {
+                    eprintln!(
+                        "Auto-resume: found incomplete plot in {}, seed={}, warps={}",
+                        dir,
+                        hex::encode_upper(plot.seed),
+                        plot.warps
+                    );
+                }
+                resume_tasks.push((plot.path, plot.seed, plot.warps, plot.compression));
+            }
+        }
+
+        if !resume_tasks.is_empty() {
+            let mut resume_paths = Vec::new();
+            let mut resume_seeds = Vec::new();
+            let mut resume_warps = Vec::new();
+            let mut resume_plots = Vec::new();
+            for (path, seed_val, warp_count, _comp) in &resume_tasks {
+                resume_paths.push(path.clone());
+                resume_seeds.push(Some(*seed_val));
+                resume_warps.push(*warp_count);
+                resume_plots.push(1u64);
+            }
+            if !quiet {
+                eprintln!(
+                    "Auto-resume: resuming {} incomplete file(s) in parallel",
+                    resume_tasks.len()
+                );
+            }
+            let p = Plotter::new();
+            p.run(PlotterTask {
+                address_payload,
+                address: address.clone(),
+                network_id: network_id.clone(),
+                initial_seeds: resume_seeds,
+                warps: resume_warps,
+                number_of_plots: resume_plots,
+                output_paths: resume_paths,
+                compress,
+                mem: mem.clone(),
+                gpu: gpu.clone(),
+                direct_io: !matches.get_flag("disable-direct-io"),
+                escalate,
+                double_buffer: matches.get_flag("double-buffer"),
+                quiet,
+                benchmark: false,
+                line_progress: matches.get_flag("line-progress"),
+                kws_override,
+            })?;
+            if !quiet {
+                eprintln!(
+                    "Auto-resume: completed {} incomplete file(s)\n",
+                    resume_tasks.len()
+                );
+            }
+        }
+    }
+
+    let initial_seeds = if let Some(s) = seed {
+        vec![Some(s)]
+    } else {
+        vec![None; num_paths]
+    };
+
     let p = Plotter::new();
     p.run(PlotterTask {
         address_payload,
@@ -377,7 +531,7 @@ fn run() -> Result<()> {
         warps: vec![warps; num_paths],
         number_of_plots: vec![number_of_plots; num_paths],
         output_paths,
-        seed,
+        initial_seeds,
         compress,
         mem,
         gpu,
@@ -497,7 +651,11 @@ mod security_tests {
         let sizes = vec![4096, 1024 * 1024, 16 * 1024 * 1024];
         for size in sizes {
             let result = PageAlignedByteBuffer::new(size);
-            assert!(result.is_ok(), "Should accept reasonable buffer size: {}", size);
+            assert!(
+                result.is_ok(),
+                "Should accept reasonable buffer size: {}",
+                size
+            );
         }
     }
 
