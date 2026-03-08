@@ -26,7 +26,7 @@ use pocx_plotfile::PoCXPlotFile;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use sysinfo::System;
 
 use crate::buffer::PageAlignedByteBuffer;
@@ -423,11 +423,7 @@ impl Plotter {
                 );
             }
 
-            if total_resume == 0 {
-                println!("Starting plotting...\n");
-            } else {
-                println!("Resuming...\n");
-            }
+            println!("Start plotting...\n");
         }
 
         // Create shared empty-buffer pool
@@ -444,7 +440,6 @@ impl Plotter {
         // Progress bars (matching old plotter style)
         let multi_progress = if !task.quiet && !task.line_progress {
             let mp = MultiProgress::new();
-            mp.set_move_cursor(true);
             Some(Arc::new(mp))
         } else {
             None
@@ -458,7 +453,6 @@ impl Plotter {
                 ).unwrap()
                 .progress_chars("█░░")
             );
-            pb.enable_steady_tick(Duration::from_millis(100));
             Some(pb)
         } else {
             None
@@ -472,7 +466,6 @@ impl Plotter {
                 ).unwrap()
                 .progress_chars("█░░")
             );
-            pb.enable_steady_tick(Duration::from_millis(100));
             Some(Arc::new(pb))
         } else {
             None
@@ -510,12 +503,6 @@ impl Plotter {
                 let (tx, rx) = bounded(limit);
                 for _ in 0..limit {
                     tx.send(()).unwrap();
-                }
-                if !task.quiet {
-                    eprintln!(
-                        "Note: {} unique disks, limiting concurrent writes to {} (-c)",
-                        num_disks, limit
-                    );
                 }
                 Some((tx, rx))
             } else {
