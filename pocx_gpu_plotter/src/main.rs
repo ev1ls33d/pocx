@@ -67,8 +67,8 @@ pub fn get_plotter_callback() -> Option<Arc<dyn PlotterCallback>> {
     PLOTTER_CALLBACK.get().cloned()
 }
 
-use crate::plotter::{Plotter, PlotterTask};
-use crate::utils::set_low_prio;
+use crate::plotter::{Plotter, PlotterTask, WARP_SIZE};
+use crate::utils::{free_disk_space, set_low_prio};
 use clap::{Arg, Command};
 use std::process;
 
@@ -144,143 +144,149 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cmd = Command::new("PoCX GPU Plotter")
-        .version(env!("CARGO_PKG_VERSION"))
-        .about("PoCX GPU Plotter — ring buffer design with fused scatter+compress")
-        .arg_required_else_help(true)
-        .next_display_order(None)
-        .arg(
-            Arg::new("disable-direct-io")
-                .short('d')
-                .long("ddio")
-                .help("Disables direct i/o")
-                .action(clap::ArgAction::SetTrue)
-                .global(true),
-        )
-        .arg(
-            Arg::new("low-priority")
-                .short('l')
-                .long("prio")
-                .help("Runs plotter with low priority")
-                .action(clap::ArgAction::SetTrue)
-                .global(true),
-        )
-        .arg(
-            Arg::new("non-verbosity")
-                .short('q')
-                .long("quiet")
-                .help("Runs plotter in non-verbose mode")
-                .action(clap::ArgAction::SetTrue)
-                .global(true),
-        )
-        .arg(
-            Arg::new("benchmark")
-                .short('b')
-                .long("bench")
-                .help("Runs plotter in GPU benchmark mode")
-                .action(clap::ArgAction::SetTrue)
-                .global(true),
-        )
-        .arg(
-            Arg::new("line-progress")
-                .long("line-progress")
-                .help("Output machine-readable progress lines")
-                .action(clap::ArgAction::SetTrue)
-                .hide(true)
-                .global(true),
-        )
-        .arg(
-            Arg::new("address")
-                .short('i')
-                .long("id")
-                .value_name("address")
-                .help("your PoC mining address (any PoC coin)"),
-        )
-        .arg(
-            Arg::new("warps")
-                .short('w')
-                .long("warps")
-                .value_name("warps")
-                .help("how many warps per file (1 warp = 1 GiB, 0: fill disk, -1: fill remaining space)"),
-        )
-        .arg(
-            Arg::new("number")
-                .short('n')
-                .long("num")
-                .value_name("number")
-                .help("number of files to plot (default: 1, 0 = fill disk)"),
-        )
-        .arg(
-            Arg::new("compression")
-                .short('x')
-                .long("compression")
-                .help("compression level 1-6 (default: 1, higher = more PoW per plot)"),
-        )
-        .arg(
-            Arg::new("path")
-                .short('p')
-                .long("path")
-                .value_name("path")
-                .help("target disk path(s) for plotfile(s) (default: current path)")
-                .action(clap::ArgAction::Append),
-        )
-        .arg(
-            Arg::new("seed")
-                .short('s')
-                .long("seed")
-                .value_name("seed")
-                .help("specify seed to resume an unfinished plot (optional, needs n=1)"),
-        )
-        .arg(
-            Arg::new("memory")
-                .short('m')
-                .long("mem")
-                .value_name("memory")
-                .help("limit host memory usage (optional)"),
-        )
-        .arg(
-            Arg::new("escalate")
-                .short('e')
-                .long("escalate")
-                .help("write buffer size multiplier in warps (default: 1, e.g. -e 5 = 5 GiB buffer)"),
-        )
-        .arg(
-            Arg::new("double-buffer")
-                .short('D')
-                .long("double-buffer")
-                .help("allocate an extra write buffer for GPU/disk overlap")
-                .action(clap::ArgAction::SetTrue)
-                .global(true),
-        )
-        .arg(
-            Arg::new("gpu")
-                .short('g')
-                .long("gpu")
-                .value_name("platform_id:device_id:cores")
-                .help("GPU to use for plotting (default: 0:0:0 = first GPU, all CUs)"),
-        )
-        .arg(
-            Arg::new("no-auto-resume")
-                .long("no-auto-resume")
-                .help("Disable automatic resumption of incomplete .tmp files")
-                .action(clap::ArgAction::SetTrue)
-                .global(true),
-        )
-        .arg(
-            Arg::new("ocl-devices")
-                .short('o')
-                .long("opencl")
-                .help("Display OpenCL platforms and devices")
-                .action(clap::ArgAction::SetTrue)
-                .global(true),
-        )
-        .arg(
-            Arg::new("kws")
-                .short('k')
-                .long("kws-override")
-                .help("tweak: overrides default gpu kernel workgroup size")
-                .global(true),
-        );
+    let cmd =
+        Command::new("PoCX GPU Plotter")
+            .version(env!("CARGO_PKG_VERSION"))
+            .about("PoCX GPU Plotter — ring buffer design with fused scatter+compress")
+            .arg_required_else_help(true)
+            .next_display_order(None)
+            .arg(
+                Arg::new("disable-direct-io")
+                    .short('d')
+                    .long("ddio")
+                    .help("Disables direct i/o")
+                    .action(clap::ArgAction::SetTrue)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("low-priority")
+                    .short('l')
+                    .long("prio")
+                    .help("Runs plotter with low priority")
+                    .action(clap::ArgAction::SetTrue)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("non-verbosity")
+                    .short('q')
+                    .long("quiet")
+                    .help("Runs plotter in non-verbose mode")
+                    .action(clap::ArgAction::SetTrue)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("benchmark")
+                    .short('b')
+                    .long("bench")
+                    .help("Runs plotter in GPU benchmark mode")
+                    .action(clap::ArgAction::SetTrue)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("line-progress")
+                    .long("line-progress")
+                    .help("Output machine-readable progress lines")
+                    .action(clap::ArgAction::SetTrue)
+                    .hide(true)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("address")
+                    .short('i')
+                    .long("id")
+                    .value_name("address")
+                    .help("your PoC mining address (any PoC coin)"),
+            )
+            .arg(
+                Arg::new("warps")
+                    .short('w')
+                    .long("warps")
+                    .value_name("warps")
+                    .help("how many warps per file (1 warp = 1 GiB, 0: fill disk)"),
+            )
+            .arg(
+                Arg::new("number")
+                    .short('n')
+                    .long("num")
+                    .value_name("number")
+                    .help("number of files to plot (default: 1, 0 = fill disk)"),
+            )
+            .arg(
+                Arg::new("compression")
+                    .short('x')
+                    .long("compression")
+                    .help("compression level 1-6 (default: 1, higher = more PoW per plot)"),
+            )
+            .arg(
+                Arg::new("path")
+                    .short('p')
+                    .long("path")
+                    .value_name("path")
+                    .help("target disk path(s) for plotfile(s) (default: current path)")
+                    .action(clap::ArgAction::Append),
+            )
+            .arg(
+                Arg::new("seed")
+                    .short('s')
+                    .long("seed")
+                    .value_name("seed")
+                    .help("specify seed to resume an unfinished plot (optional, needs n=1)"),
+            )
+            .arg(
+                Arg::new("memory")
+                    .short('m')
+                    .long("mem")
+                    .value_name("memory")
+                    .help("limit host memory usage (optional)"),
+            )
+            .arg(Arg::new("escalate").short('e').long("escalate").help(
+                "write buffer size multiplier in warps (default: 1, e.g. -e 5 = 5 GiB buffer)",
+            ))
+            .arg(
+                Arg::new("double-buffer")
+                    .short('D')
+                    .long("double-buffer")
+                    .help("allocate an extra write buffer for GPU/disk overlap")
+                    .action(clap::ArgAction::SetTrue)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("gpu")
+                    .short('g')
+                    .long("gpu")
+                    .value_name("platform_id:device_id:cores")
+                    .help("GPU to use for plotting (default: 0:0:0 = first GPU, all CUs)"),
+            )
+            .arg(
+                Arg::new("fill")
+                    .short('f')
+                    .long("fill")
+                    .help("After plotting, fill remaining disk space with one last file per path")
+                    .action(clap::ArgAction::SetTrue)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("no-auto-resume")
+                    .long("no-auto-resume")
+                    .help("Disable automatic resumption of incomplete .tmp files")
+                    .action(clap::ArgAction::SetTrue)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("ocl-devices")
+                    .short('o')
+                    .long("opencl")
+                    .help("Display OpenCL platforms and devices")
+                    .action(clap::ArgAction::SetTrue)
+                    .global(true),
+            )
+            .arg(
+                Arg::new("kws")
+                    .short('k')
+                    .long("kws-override")
+                    .help("tweak: overrides default gpu kernel workgroup size")
+                    .global(true),
+            );
 
     let matches = cmd.get_matches();
 
@@ -314,31 +320,26 @@ fn run() -> Result<()> {
     let (address_payload, network_id) = pocx_address::decode_address(&address)
         .map_err(|e| PoCXPlotterError::Crypto(format!("Invalid address: {}", e)))?;
 
+    let fill_last = matches.get_flag("fill");
+
     let warps = matches
         .get_one::<String>("warps")
         .map(|s| {
-            let value = s.parse::<i64>().map_err(|e| {
+            let value = s.parse::<u64>().map_err(|e| {
                 PoCXPlotterError::InvalidInput(format!("Invalid warps value: {}", e))
             })?;
-            if value == -1 {
-                return Ok::<u64, PoCXPlotterError>(u64::MAX);
-            }
-            if value < 0 {
-                return Err(PoCXPlotterError::InvalidInput(
-                    "Warps must be >= 0 or -1 (fill remaining space)".to_string(),
-                ));
-            }
-            let value = value as u64;
             if value > 1_000_000 {
                 return Err(PoCXPlotterError::InvalidInput(
                     "Warps value too large: maximum 1,000,000 allowed".to_string(),
                 ));
             }
-            Ok::<u64, PoCXPlotterError>(value)
+            Ok(value)
         })
         .transpose()?
         .unwrap_or(0);
 
+    // When fill_last and -n not specified, default to 0 (fill disk with full-sized files)
+    let number_of_plots_default = if fill_last { 0 } else { 1 };
     let number_of_plots = matches
         .get_one::<String>("number")
         .map(|s| {
@@ -346,7 +347,7 @@ fn run() -> Result<()> {
                 .map_err(|e| PoCXPlotterError::InvalidInput(format!("Invalid number value: {}", e)))
         })
         .transpose()?
-        .unwrap_or(1);
+        .unwrap_or(number_of_plots_default);
 
     let escalate = matches
         .get_one::<String>("escalate")
@@ -526,15 +527,15 @@ fn run() -> Result<()> {
     let p = Plotter::new();
     p.run(PlotterTask {
         address_payload,
-        address,
-        network_id,
+        address: address.clone(),
+        network_id: network_id.clone(),
         warps: vec![warps; num_paths],
         number_of_plots: vec![number_of_plots; num_paths],
-        output_paths,
+        output_paths: output_paths.clone(),
         initial_seeds,
         compress,
-        mem,
-        gpu,
+        mem: mem.clone(),
+        gpu: gpu.clone(),
         direct_io: !matches.get_flag("disable-direct-io"),
         escalate,
         double_buffer: matches.get_flag("double-buffer"),
@@ -543,6 +544,56 @@ fn run() -> Result<()> {
         line_progress: matches.get_flag("line-progress"),
         kws_override,
     })?;
+
+    // Fill-last: after main plotting, create one more file per path with remaining space
+    if fill_last && !matches.get_flag("benchmark") {
+        let mut fill_paths = Vec::new();
+        let mut fill_warps = Vec::new();
+
+        for path in &output_paths {
+            if let Ok(space) = free_disk_space(path) {
+                let remaining_warps = space / WARP_SIZE;
+                if remaining_warps > 0 {
+                    if !quiet {
+                        eprintln!(
+                            "Fill-last: {} has {:.2} GiB remaining, creating {}-warp file",
+                            path,
+                            space as f64 / 1024.0 / 1024.0 / 1024.0,
+                            remaining_warps
+                        );
+                    }
+                    fill_paths.push(path.clone());
+                    fill_warps.push(remaining_warps);
+                }
+            }
+        }
+
+        if !fill_paths.is_empty() {
+            let fill_seeds = vec![None; fill_paths.len()];
+            let fill_plots = vec![1u64; fill_paths.len()];
+
+            let p = Plotter::new();
+            p.run(PlotterTask {
+                address_payload,
+                address,
+                network_id,
+                initial_seeds: fill_seeds,
+                warps: fill_warps,
+                number_of_plots: fill_plots,
+                output_paths: fill_paths,
+                compress,
+                mem,
+                gpu,
+                direct_io: !matches.get_flag("disable-direct-io"),
+                escalate,
+                double_buffer: matches.get_flag("double-buffer"),
+                quiet,
+                benchmark: false,
+                line_progress: matches.get_flag("line-progress"),
+                kws_override,
+            })?;
+        }
+    }
 
     Ok(())
 }

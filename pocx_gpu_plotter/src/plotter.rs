@@ -141,7 +141,7 @@ impl Plotter {
         // Validate warps and disk space per path
         if task.benchmark {
             for i in 0..task.output_paths.len() {
-                if task.warps[i] == 0 || task.warps[i] == u64::MAX {
+                if task.warps[i] == 0 {
                     task.warps[i] = 1;
                 }
                 if task.number_of_plots[i] == 0 {
@@ -160,35 +160,7 @@ impl Plotter {
 
                 let space = free_disk_space(&task.output_paths[i])?;
 
-                if task.warps[i] == u64::MAX {
-                    // -w -1: fill remaining space
-                    let n = if task.number_of_plots[i] == 0 {
-                        1
-                    } else {
-                        task.number_of_plots[i]
-                    };
-                    task.warps[i] = space / WARP_SIZE / n;
-                    if task.number_of_plots[i] == 0 {
-                        task.number_of_plots[i] = 1;
-                    }
-                    if task.warps[i] == 0 {
-                        return Err(PoCXPlotterError::Config(format!(
-                            "Insufficient remaining disk space to fill, \
-                             MiB_available={:.2}, path={}",
-                            space as f64 / 1024.0 / 1024.0,
-                            &task.output_paths[i]
-                        )));
-                    }
-                    if !task.quiet {
-                        eprintln!(
-                            "Fill mode: detected {:.2} GiB free on {}, using {} warps x {} file(s)",
-                            space as f64 / 1024.0 / 1024.0 / 1024.0,
-                            &task.output_paths[i],
-                            task.warps[i],
-                            task.number_of_plots[i]
-                        );
-                    }
-                } else if task.warps[i] == 0 {
+                if task.warps[i] == 0 {
                     if task.number_of_plots[i] == 0 {
                         return Err(PoCXPlotterError::InvalidInput(
                             "Need to specify either number of plots or number of warps".to_string(),
