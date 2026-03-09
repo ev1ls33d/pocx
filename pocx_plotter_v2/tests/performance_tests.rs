@@ -5,7 +5,7 @@
 // Copyright (c) 2025 Proof of Capacity Consortium
 // MIT License
 
-use pocx_gpu_plotter::PageAlignedByteBuffer;
+use pocx_plotter_v2::PageAlignedByteBuffer;
 use std::time::Instant;
 
 #[test]
@@ -28,7 +28,11 @@ fn test_buffer_allocation_performance() {
         let page_size = page_size::get();
         assert_eq!(ptr % page_size, 0, "Buffer should be page-aligned");
 
-        println!("Buffer {}KB: allocated in {:?}", size / 1024, allocation_time);
+        println!(
+            "Buffer {}KB: allocated in {:?}",
+            size / 1024,
+            allocation_time
+        );
     }
 
     for i in 1..allocation_times.len() {
@@ -251,7 +255,7 @@ fn test_performance_scaling() {
 #[cfg(feature = "opencl")]
 #[test]
 fn test_ring_size_computation_performance() {
-    use pocx_gpu_plotter::ocl::compute_ring_size;
+    use pocx_plotter_v2::ocl::compute_ring_size;
 
     let start = Instant::now();
     for worksize in (256..32768).step_by(256) {
