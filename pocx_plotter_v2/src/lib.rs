@@ -47,11 +47,13 @@ pub fn clear_stop_request() {
 }
 
 pub mod buffer;
+pub mod cpu_compressor;
+pub mod cpu_hasher;
+pub mod cpu_scheduler;
 pub mod disk_writer;
 pub mod error;
 #[cfg(feature = "opencl")]
 pub mod ocl;
-pub mod perf_monitor;
 pub mod plotter;
 #[cfg(feature = "opencl")]
 pub mod ring_scheduler;
@@ -146,6 +148,7 @@ pub struct PlotterTaskBuilder {
     output_paths: Vec<String>,
     mem: String,
     gpu: String,
+    cpu_threads: u8,
     compress: u8,
     direct_io: bool,
     escalate: u64,
@@ -209,7 +212,12 @@ impl PlotterTaskBuilder {
         self
     }
 
-    pub fn compress(mut self, level: u8) -> Self {
+    pub fn cpu_threads(mut self, threads: u8) -> Self {
+        self.cpu_threads = threads;
+        self
+    }
+
+    pub fn compression(mut self, level: u8) -> Self {
         self.compress = level;
         self
     }
@@ -263,9 +271,9 @@ impl PlotterTaskBuilder {
             ));
         }
 
-        if self.gpu.is_empty() {
+        if self.gpu.is_empty() && self.cpu_threads == 0 {
             return Err(PoCXPlotterError::InvalidInput(
-                "GPU is required (e.g. '0:0:0')".to_string(),
+                "Either GPU (e.g. '0:0:0') or CPU threads must be specified".to_string(),
             ));
         }
 
@@ -284,6 +292,7 @@ impl PlotterTaskBuilder {
             output_paths: self.output_paths,
             mem: self.mem,
             gpu: self.gpu,
+            cpu_threads: self.cpu_threads as usize,
             direct_io: self.direct_io,
             escalate: self.escalate,
             double_buffer: self.double_buffer,

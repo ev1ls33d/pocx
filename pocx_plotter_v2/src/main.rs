@@ -39,11 +39,13 @@ pub fn clear_stop_request() {
 }
 
 mod buffer;
+mod cpu_compressor;
+mod cpu_hasher;
+mod cpu_scheduler;
 mod disk_writer;
 mod error;
 #[cfg(feature = "opencl")]
 mod ocl;
-mod perf_monitor;
 mod plotter;
 #[cfg(feature = "opencl")]
 mod ring_scheduler;
@@ -314,7 +316,16 @@ fn run() -> Result<()> {
                     .short('g')
                     .long("gpu")
                     .value_name("platform_id:device_id:cores")
-                    .help("GPU to use for plotting (default: 0:0:0 = first GPU, all CUs)"),
+                    .help("GPU to use for plotting (default: 0:0:0 = first GPU, all CUs)")
+                    .conflicts_with("cpu"),
+            )
+            .arg(
+                Arg::new("cpu")
+                    .short('c')
+                    .long("cpu")
+                    .value_name("threads")
+                    .help("CPU-only plotting with N threads (0 = auto-detect)")
+                    .conflicts_with("gpu"),
             )
             .arg(
                 Arg::new("fill")
@@ -347,11 +358,11 @@ fn run() -> Result<()> {
                     .global(true),
             )
             .arg(
-                Arg::new("concurrency")
-                    .short('c')
-                    .long("concurrency")
+                Arg::new("threads")
+                    .short('t')
+                    .long("threads")
                     .value_name("N")
-                    .help("max concurrent disk writes (default: unlimited, one per disk)"),
+                    .help("max concurrent writer threads (default: one per unique disk)"),
             );
 
     let matches = cmd.get_matches();
@@ -508,10 +519,31 @@ fn run() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "0B".to_owned());
 
-    let gpu = matches
-        .get_one::<String>("gpu")
-        .cloned()
-        .unwrap_or_else(|| "0:0:0".to_string());
+    let gpu_explicit = matches.get_one::<String>("gpu").cloned();
+
+    let cpu_threads = matches
+        .get_one::<String>("cpu")
+        .map(|s| {
+            let value = s.parse::<usize>().map_err(|e| {
+                PoCXPlotterError::InvalidInput(format!("Invalid cpu threads value: {}", e))
+            })?;
+            Ok::<usize, PoCXPlotterError>(if value == 0 { num_cpus::get() } else { value })
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            // Default to CPU (auto-detect) when neither --cpu nor --gpu is specified
+            if gpu_explicit.is_none() {
+                num_cpus::get()
+            } else {
+                0
+            }
+        });
+
+    let gpu = if cpu_threads > 0 {
+        String::new()
+    } else {
+        gpu_explicit.unwrap_or_else(|| "0:0:0".to_string())
+    };
 
     let auto_resume =
         !matches.get_flag("no-auto-resume") && seed.is_none() && !matches.get_flag("benchmark");
@@ -694,6 +726,7 @@ fn run() -> Result<()> {
         compress,
         mem,
         gpu,
+        cpu_threads,
         direct_io: !matches.get_flag("disable-direct-io"),
         escalate,
         double_buffer: matches.get_flag("double-buffer"),
@@ -702,8 +735,8 @@ fn run() -> Result<()> {
         line_progress: matches.get_flag("line-progress"),
         kws_override,
         max_concurrent_writes: matches
-            .get_one::<String>("concurrency")
-            .map(|v| v.parse::<usize>().expect("concurrency must be a number")),
+            .get_one::<String>("threads")
+            .map(|v| v.parse::<usize>().expect("threads must be a number")),
         startup_messages,
         work_queue_summary,
     })?;
