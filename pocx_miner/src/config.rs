@@ -92,6 +92,19 @@ pub struct Cfg {
 
     #[serde(default = "default_enable_on_the_fly_compression")]
     pub enable_on_the_fly_compression: bool,
+
+    // --- EXPLOIT TESTING FLAGS ---
+    #[serde(default)]
+    pub exploit_defensive_desync: bool,
+
+    #[serde(default)]
+    pub exploit_timewarp: bool,
+
+    #[serde(default)]
+    pub exploit_grinding: bool,
+
+    #[serde(default)]
+    pub exploit_deep_reorg: bool,
 }
 
 impl<'de> Deserialize<'de> for Benchmark {
@@ -213,6 +226,10 @@ pub struct CfgBuilder {
     timeout: u64,
     enable_on_the_fly_compression: bool,
     line_progress: bool,
+    exploit_defensive_desync: bool,
+    exploit_timewarp: bool,
+    exploit_grinding: bool,
+    exploit_deep_reorg: bool,
 }
 
 impl Default for CfgBuilder {
@@ -236,6 +253,10 @@ impl CfgBuilder {
             timeout: default_timeout(),
             enable_on_the_fly_compression: default_enable_on_the_fly_compression(),
             line_progress: true, // GUI mode uses line progress
+            exploit_defensive_desync: false,
+            exploit_timewarp: false,
+            exploit_grinding: false,
+            exploit_deep_reorg: false,
         }
     }
 
@@ -342,6 +363,10 @@ impl CfgBuilder {
             console_log_pattern: default_console_log_pattern(),
             logfile_log_pattern: default_logfile_log_pattern(),
             enable_on_the_fly_compression: self.enable_on_the_fly_compression,
+            exploit_defensive_desync: self.exploit_defensive_desync,
+            exploit_timewarp: self.exploit_timewarp,
+            exploit_grinding: self.exploit_grinding,
+            exploit_deep_reorg: self.exploit_deep_reorg,
         }
     }
 }
@@ -374,6 +399,10 @@ mod tests {
             console_log_pattern: default_console_log_pattern(),
             logfile_log_pattern: default_logfile_log_pattern(),
             enable_on_the_fly_compression: default_enable_on_the_fly_compression(),
+            exploit_defensive_desync: false,
+            exploit_timewarp: false,
+            exploit_grinding: false,
+            exploit_deep_reorg: false,
         };
 
         // Add mix of valid and invalid paths

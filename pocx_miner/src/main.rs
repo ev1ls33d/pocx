@@ -71,6 +71,30 @@ async fn main() {
                 .action(clap::ArgAction::SetTrue)
                 .help("Enable machine-parsable progress protocol for GUI")
                 .hide(true),
+        )
+        .arg(
+            Arg::new("exploit-defensive-desync")
+                .long("exploit-defensive-desync")
+                .action(clap::ArgAction::SetTrue)
+                .help("TESTNET EXPLOIT: Triggers Defensive Forging network desync by rapidly submitting competitive templates"),
+        )
+        .arg(
+            Arg::new("exploit-timewarp")
+                .long("exploit-timewarp")
+                .action(clap::ArgAction::SetTrue)
+                .help("TESTNET EXPLOIT: Inflates timestamps to maximum future limit to drop rolling difficulty"),
+        )
+        .arg(
+            Arg::new("exploit-grinding")
+                .long("exploit-grinding")
+                .action(clap::ArgAction::SetTrue)
+                .help("TESTNET EXPLOIT: Rapidly poll node for new block templates to grind generation signature"),
+        )
+        .arg(
+            Arg::new("exploit-deep-reorg")
+                .long("exploit-deep-reorg")
+                .action(clap::ArgAction::SetTrue)
+                .help("TESTNET EXPLOIT: Mines isolated chain starting from deeply historical block using raw disk IO speed"),
         );
 
     let matches = arg.get_matches();
@@ -84,10 +108,44 @@ async fn main() {
         // Mutual exclusivity: line_progress disables show_progress
         cfg_loaded.show_progress = false;
     }
+
+    if matches.get_flag("exploit-defensive-desync") {
+        cfg_loaded.exploit_defensive_desync = true;
+    }
+    if matches.get_flag("exploit-timewarp") {
+        cfg_loaded.exploit_timewarp = true;
+    }
+    if matches.get_flag("exploit-grinding") {
+        cfg_loaded.exploit_grinding = true;
+    }
+    if matches.get_flag("exploit-deep-reorg") {
+        cfg_loaded.exploit_deep_reorg = true;
+    }
+
     logger::init_logger(&cfg_loaded);
 
     info!("PoCX Miner {}", env!("CARGO_PKG_VERSION"));
     info!("{}", crate_description!());
+
+    if cfg_loaded.exploit_defensive_desync
+        || cfg_loaded.exploit_timewarp
+        || cfg_loaded.exploit_grinding
+        || cfg_loaded.exploit_deep_reorg
+    {
+        warn!("WARNING: MINER IS RUNNING IN EXPLOIT TESTING MODE");
+        if cfg_loaded.exploit_defensive_desync {
+            warn!("  -> Defensive Forging Desync Exploit ENABLED");
+        }
+        if cfg_loaded.exploit_timewarp {
+            warn!("  -> Timewarp Window Exploit ENABLED");
+        }
+        if cfg_loaded.exploit_grinding {
+            warn!("  -> Signature Grinding Exploit ENABLED");
+        }
+        if cfg_loaded.exploit_deep_reorg {
+            warn!("  -> Deep History Reorg Exploit ENABLED");
+        }
+    }
 
     let m = Miner::new(cfg_loaded);
     m.run().await;

