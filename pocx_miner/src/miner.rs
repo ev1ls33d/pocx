@@ -58,6 +58,25 @@ use url::Url;
 // Re-export shared RPC types from pocx_protocol
 pub use pocx_protocol::{RpcAuth, RpcTransport, SubmissionMode};
 
+/// Maximum future block time in seconds (Bitcoin Core MAX_FUTURE_BLOCK_TIME).
+/// Timewarp attackers set timestamps this far ahead to drop rolling difficulty.
+const TIMEWARP_FUTURE_SECONDS: u64 = 7140;
+
+/// Factor by which the effective base_target is multiplied to simulate the difficulty
+/// drop caused by TIMEWARP_FUTURE_SECONDS of timestamp inflation.
+const TIMEWARP_BASE_TARGET_MULTIPLIER: u64 = 2;
+
+/// Quality degradation added to the decoy nonce in the defensive-desync exploit,
+/// expressed as a multiple of base_target (adjusted-quality units).
+const DECOY_QUALITY_DEGRADATION_FACTOR: u64 = 500;
+
+/// Delay in milliseconds between the decoy and real nonce submissions in the
+/// defensive-desync exploit, giving the node time to process the decoy first.
+const DECOY_SUBMISSION_DELAY_MS: u64 = 50;
+
+/// Polling interval in milliseconds used by the generation-signature grinding exploit.
+const GRINDING_POLL_INTERVAL_MS: u64 = 50;
+
 fn default_submission_mode() -> SubmissionMode {
     SubmissionMode::Pool
 }
@@ -580,9 +599,10 @@ impl Miner {
             let tx_scheduler = self.channels.tx_scheduler.clone();
             let get_mining_info_interval = if self.cfg.exploit_grinding {
                 warn!(
-                    "EXPLOIT (Grinding): Polling get_mining_info at 50ms intervals to grind generation signature from mempool variations"
+                    "EXPLOIT (Grinding): Polling get_mining_info at {}ms intervals to grind generation signature from mempool variations",
+                    GRINDING_POLL_INTERVAL_MS
                 );
-                50u64
+                GRINDING_POLL_INTERVAL_MS
             } else {
                 self.get_mining_info_interval
             };
@@ -1109,11 +1129,13 @@ impl Miner {
                         let effective_base_target =
                             if exploit_timewarp && chain_state.base_target > 0 {
                                 warn!(
-                                    "EXPLOIT (Timewarp): Simulating 7140s timestamp inflation - doubling effective base_target ({} -> {}) to reflect dropped rolling difficulty",
+                                    "EXPLOIT (Timewarp): Simulating {}s timestamp inflation - {}x effective base_target ({} -> {}) to reflect dropped rolling difficulty",
+                                    TIMEWARP_FUTURE_SECONDS,
+                                    TIMEWARP_BASE_TARGET_MULTIPLIER,
                                     chain_state.base_target,
-                                    chain_state.base_target.saturating_mul(2)
+                                    chain_state.base_target.saturating_mul(TIMEWARP_BASE_TARGET_MULTIPLIER)
                                 );
-                                chain_state.base_target.saturating_mul(2)
+                                chain_state.base_target.saturating_mul(TIMEWARP_BASE_TARGET_MULTIPLIER)
                             } else {
                                 chain_state.base_target
                             };
@@ -1167,7 +1189,10 @@ impl Miner {
                                 d.nonce_submission.raw_quality = d
                                     .nonce_submission
                                     .raw_quality
-                                    .saturating_add(effective_base_target.saturating_mul(500));
+                                    .saturating_add(
+                                        effective_base_target
+                                            .saturating_mul(DECOY_QUALITY_DEGRADATION_FACTOR),
+                                    );
                                 warn!(
                                     "EXPLOIT (Defensive Desync): Submitting decoy nonce with degraded quality {} before real quality {}",
                                     d.nonce_submission.raw_quality,
@@ -1193,8 +1218,8 @@ impl Miner {
                 if qualifies {
                     if let Some(decoy) = desync_decoy {
                         request_handler[chain_id].submit_nonce(decoy);
-                        // Brief pause so the node processes the decoy before the real nonce
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        // Pause so the node processes the decoy before the real nonce
+                        tokio::time::sleep(Duration::from_millis(DECOY_SUBMISSION_DELAY_MS)).await;
                     }
                     request_handler[chain_id].submit_nonce(submission_parameter);
                 }
